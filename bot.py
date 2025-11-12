@@ -15,22 +15,13 @@ from aiogram.exceptions import (
 
 # ================== НАСТРОЙКИ ==================
 
-# Токен бота
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    # Лучше упасть сразу с понятной ошибкой, чем с KeyError
     raise RuntimeError("Переменная окружения BOT_TOKEN не задана. Укажи токен бота в Env Vars.")
 
-# Максимальная длительность видео (секунды)
 VIDEO_MAX_DURATION = int(os.getenv("VIDEO_MAX_DURATION", "90"))
-
-# Максимальный размер файла (байты) — по умолчанию ~20 МБ
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", str(20 * 1024 * 1024)))
-
-# Имя бинарника ffmpeg (если что, можно переопределить)
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
-
-# Папка для временных файлов
 TMP_DIR = Path(os.getenv("TMP_DIR", "tmp"))
 
 # ================== ЛОГИРОВАНИЕ ==================
@@ -50,34 +41,35 @@ dp = Dispatcher()
 
 def build_ffmpeg_cmd(input_path: Path, output_path: Path) -> list[str]:
     """
-    Команда ffmpeg:
-    - делает видео квадратным 640x640
-    - сохраняет пропорции с паддингом
-    - кодирует в H.264
+    ffmpeg:
+    - делает квадрат 640x640
+    - без чёрных полей: зум + кроп по центру
+    - видео H.264, аудио AAC
     """
     return [
         FFMPEG_BIN,
-        "-y",  # overwrite без вопросов
+        "-y",
         "-i",
         str(input_path),
         "-vf",
-        "scale=640:640:force_original_aspect_ratio=decrease,"
-        "pad=640:640:(ow-iw)/2:(oh-ih)/2",
+        # зум до заполнения + кроп центрального квадрата
+        "scale=640:640:force_original_aspect_ratio=increase,"
+        "crop=640:640",
         "-c:v",
         "libx264",
         "-preset",
         "fast",
         "-movflags",
         "+faststart",
-        "-an",  # без аудио (для кружков не критично)
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
         str(output_path),
     ]
 
 
 async def run_ffmpeg(cmd: list[str], timeout: int = 120) -> None:
-    """
-    Асинхронный запуск ffmpeg с таймаутом.
-    """
     logger.info("Running ffmpeg: %s", " ".join(cmd))
     try:
         process = await asyncio.create_subprocess_exec(
@@ -106,9 +98,6 @@ async def run_ffmpeg(cmd: list[str], timeout: int = 120) -> None:
 
 
 def human_size(num_bytes: int) -> str:
-    """
-    Человекочитаемый размер файла.
-    """
     mb = num_bytes / 1024 / 1024
     return f"{mb:.1f} МБ"
 
@@ -122,7 +111,7 @@ async def cmd_start(message: Message):
         "Привет! 👋\n"
         "Я превращаю обычные видео в телеграм-кружочки.\n\n"
         "Просто пришли мне видео (до "
-        f"{VIDEO_MAX_DURATION} секунд и примерно {human_size(MAX_FILE_SIZE)}), "
+        f"{VIDEO_MAX_DURATION} секунд и ~{human_size(MAX_FILE_SIZE)}), "
         "а я верну его как video note 🟣"
     )
 
@@ -134,7 +123,7 @@ async def cmd_help(message: Message):
         "1️⃣ Отправь обычное видео (не кружочек).\n"
         f"2️⃣ Длительность — до {VIDEO_MAX_DURATION} секунд.\n"
         f"3️⃣ Размер — до ~{human_size(MAX_FILE_SIZE)}.\n"
-        "4️⃣ Я обработаю его и отправлю в виде круглого видео (video note).\n\n"
+        "4️⃣ Я обработаю его и отправлю в виде круглого видео (со звуком!).\n\n"
         "Если что-то не работает — попробуй отправить видео меньшего размера или короче."
     )
 
@@ -146,7 +135,6 @@ async def cmd_health(message: Message):
 
 @dp.message(F.text)
 async def handle_text(message: Message):
-    # Немного UX — объяснить, что нужно делать
     if message.text.startswith("/"):
         await message.answer("Не знаю такую команду 🤔 Попробуй /start, /help или просто пришли видео.")
     else:
@@ -172,7 +160,6 @@ async def handle_video(message: Message):
         video.mime_type,
     )
 
-    # --- Проверка длительности ---
     if video.duration and video.duration > VIDEO_MAX_DURATION:
         await message.answer(
             f"Видео слишком длинное ({video.duration} сек). "
@@ -180,7 +167,6 @@ async def handle_video(message: Message):
         )
         return
 
-    # --- Проверка размера файла ---
     if video.file_size and video.file_size > MAX_FILE_SIZE:
         await message.answer(
             f"Файл слишком большой ({human_size(video.file_size)}). "
@@ -190,14 +176,13 @@ async def handle_video(message: Message):
 
     status_msg = await message.answer("Принял видео, обрабатываю кружочек... 🔄")
 
-    # Готовим временные файлы
     TMP_DIR.mkdir(exist_ok=True)
     tmp_id = str(uuid.uuid4())
     input_path = TMP_DIR / f"input_{tmp_id}.mp4"
     output_path = TMP_DIR / f"circle_{tmp_id}.mp4"
 
     try:
-        # --- Скачиваем видео из Telegram ---
+        # --- Скачивание ---
         try:
             file = await bot.get_file(video.file_id)
         except TelegramBadRequest as e:
@@ -223,7 +208,7 @@ async def handle_video(message: Message):
             )
             return
 
-        # --- Конвертируем через ffmpeg ---
+        # --- Конвертация ---
         cmd = build_ffmpeg_cmd(input_path, output_path)
         await run_ffmpeg(cmd)
 
@@ -234,7 +219,7 @@ async def handle_video(message: Message):
             )
             return
 
-        # --- Отправляем как video_note ---
+        # --- Отправка кружочка ---
         logger.info("Sending video_note from %s (size=%s bytes)", output_path, output_path.stat().st_size)
         video_note = FSInputFile(output_path)
 
@@ -242,7 +227,7 @@ async def handle_video(message: Message):
             await bot.send_video_note(
                 chat_id=message.chat.id,
                 video_note=video_note,
-                # length не указываем — Telegram сам решит, чтобы не словить "wrong video note length"
+                # length не указываем — Telegram сам решит
             )
         except TelegramBadRequest as e:
             logger.error("TelegramBadRequest при send_video_note: %s", e)
@@ -268,24 +253,20 @@ async def handle_video(message: Message):
         await status_msg.edit_text("Готово! Вот твой кружочек 🟣")
 
     except RuntimeError as e:
-        # Наши осознанные ошибки (ffmpeg not found, timeout, fail)
         logger.error("RuntimeError при обработке видео: %s", e)
         await status_msg.edit_text(
             f"Не получилось обработать видео ({e}). "
             "Если проблема повторяется — напиши разработчику бота."
         )
     except Exception as e:
-        # Любая неожиданная ошибка
         logger.exception("Unexpected error while handling video")
         try:
             await status_msg.edit_text(
                 f"Что-то пошло не так ({type(e).__name__}): {e}"
             )
         except Exception:
-            # сообщение могло уже исчезнуть/измениться
             pass
     finally:
-        # --- Чистим временные файлы ---
         for path in (input_path, output_path):
             try:
                 if path.exists():
