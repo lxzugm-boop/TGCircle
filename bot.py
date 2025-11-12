@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import os
@@ -11,9 +10,14 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, FSInputFile
 
 # --- Settings ---
-BOT_TOKEN = os.environ["BOT_TOKEN"]  # set on Render
-VIDEO_MAX_DURATION = int(os.getenv("VIDEO_MAX_DURATION", "90"))  # seconds
-FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")  # just in case
+# Токен задаём через переменную окружения BOT_TOKEN (на Render / локально)
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+
+# Максимальная длительность видео (в секундах)
+VIDEO_MAX_DURATION = int(os.getenv("VIDEO_MAX_DURATION", "90"))
+
+# Бинарник ffmpeg (по умолчанию "ffmpeg")
+FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
 
 
 # --- Logging ---
@@ -29,33 +33,33 @@ dp = Dispatcher()
 
 def build_ffmpeg_cmd(input_path: Path, output_path: Path) -> list:
     """
-    Build ffmpeg command that:
-    - makes video square 720x720
-    - keeps aspect ratio with padding
-    - encodes to H.264
+    Собираем команду ffmpeg, которая:
+    - делает видео квадратным 640x640
+    - сохраняет пропорции с паддингом
+    - кодирует в H.264
     """
     return [
         FFMPEG_BIN,
-        "-y",  # overwrite
+        "-y",  # overwrite без вопросов
         "-i",
         str(input_path),
         "-vf",
-        "scale=720:720:force_original_aspect_ratio=decrease,"
-        "pad=720:720:(ow-iw)/2:(oh-ih)/2",
+        "scale=640:640:force_original_aspect_ratio=decrease,"
+        "pad=640:640:(ow-iw)/2:(oh-ih)/2",
         "-c:v",
         "libx264",
         "-preset",
         "fast",
         "-movflags",
         "+faststart",
-        "-an",  # drop audio (кружочки обычно без важного звука)
+        "-an",  # без аудио (для кружков обычно не критично)
         str(output_path),
     ]
 
 
 async def run_ffmpeg(cmd: list) -> None:
     """
-    Run ffmpeg asynchronously.
+    Асинхронно запускаем ffmpeg.
     """
     logger.info("Running ffmpeg: %s", " ".join(cmd))
     process = await asyncio.create_subprocess_exec(
@@ -65,7 +69,11 @@ async def run_ffmpeg(cmd: list) -> None:
     )
     _, stderr = await process.communicate()
     if process.returncode != 0:
-        logger.error("ffmpeg failed with code %s, stderr: %s", process.returncode, stderr.decode(errors="ignore"))
+        logger.error(
+            "ffmpeg failed with code %s, stderr: %s",
+            process.returncode,
+            stderr.decode(errors="ignore"),
+        )
         raise RuntimeError("ffmpeg failed")
 
 
@@ -104,6 +112,7 @@ async def handle_text(message: Message):
 async def handle_video(message: Message):
     video = message.video
 
+    # Проверяем длительность
     if video.duration and video.duration > VIDEO_MAX_DURATION:
         await message.answer(
             f"Видео слишком длинное ({video.duration} сек). "
@@ -125,7 +134,7 @@ async def handle_video(message: Message):
         file = await bot.get_file(video.file_id)
         await bot.download(file, destination=input_path)
 
-        # 2. Конвертируем
+        # 2. Конвертируем через ffmpeg
         cmd = build_ffmpeg_cmd(input_path, output_path)
         await run_ffmpeg(cmd)
 
@@ -135,7 +144,7 @@ async def handle_video(message: Message):
         await bot.send_video_note(
             chat_id=message.chat.id,
             video_note=video_note,
-            length=720,
+            # length не указываем, чтобы не ловить "wrong video note length"
         )
 
         await status_msg.edit_text("Готово! Вот твой кружочек 🟣")
@@ -164,12 +173,15 @@ async def handle_video(message: Message):
 
 @dp.message(F.video_note)
 async def handle_video_note(message: Message):
-    await message.answer("Ты отправил уже кружочек 😊\nПришли обычное видео, чтобы я сделал кружок из него.")
+    await message.answer(
+        "Ты отправил уже кружочек 😊\n"
+        "Пришли обычное видео, чтобы я сделал кружок из него."
+    )
 
 
 @dp.message(Command("health"))
 async def cmd_health(message: Message):
-    # простейший хелсчек для тебя
+    # простейший хелсчек
     await message.answer("✅ Бот в строю и готов к работе.")
 
 
