@@ -24,6 +24,9 @@ MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", str(20 * 1024 * 1024)))
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
 TMP_DIR = Path(os.getenv("TMP_DIR", "tmp"))
 
+# Порт для HTTP-сервера (Render задаёт PORT автоматически)
+PORT = int(os.getenv("PORT", "10000"))
+
 # ================== ЛОГИРОВАНИЕ ==================
 
 logging.basicConfig(
@@ -52,7 +55,6 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path) -> list[str]:
         "-i",
         str(input_path),
         "-vf",
-        # зум до заполнения + кроп центрального квадрата
         "scale=640:640:force_original_aspect_ratio=increase,"
         "crop=640:640",
         "-c:v",
@@ -276,17 +278,56 @@ async def handle_video(message: Message):
                 logger.warning("Не удалось удалить временный файл %s: %s", path, cleanup_err)
 
 
+# ================== МИНИ-HTTP СЕРВЕР ДЛЯ RENDER ==================
+
+
+async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    """
+    Простейший HTTP-ответ, чтобы Render видел открытый порт и успешный healthcheck.
+    """
+    try:
+        # читаем хотя бы что-то из запроса (но можно и не читать)
+        await reader.read(1024)
+    except Exception:
+        pass
+
+    response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
+    writer.write(response)
+    try:
+        await writer.drain()
+    except Exception:
+        pass
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except Exception:
+        pass
+
+
+async def start_http_server():
+    server = await asyncio.start_server(handle_http, "0.0.0.0", PORT)
+    addr = ", ".join(str(sock.getsockname()) for sock in server.sockets)
+    logger.info("HTTP server listening on %s", addr)
+    async with server:
+        await server.serve_forever()
+
+
 # ================== ТОЧКА ВХОДА ==================
 
 
 async def main():
     logger.info(
-        "Starting bot polling... VIDEO_MAX_DURATION=%s, MAX_FILE_SIZE=%s, FFMPEG_BIN=%s",
+        "Starting bot polling + HTTP server... VIDEO_MAX_DURATION=%s, MAX_FILE_SIZE=%s, FFMPEG_BIN=%s, PORT=%s",
         VIDEO_MAX_DURATION,
         MAX_FILE_SIZE,
         FFMPEG_BIN,
+        PORT,
     )
-    await dp.start_polling(bot)
+
+    bot_task = asyncio.create_task(dp.start_polling(bot))
+    http_task = asyncio.create_task(start_http_server())
+
+    await asyncio.gather(bot_task, http_task)
 
 
 if __name__ == "__main__":
