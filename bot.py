@@ -60,18 +60,18 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path) -> list[str]:
         "-c:v",
         "libx264",
         "-preset",
-        "fast",
+        "ultrafast",
         "-movflags",
         "+faststart",
         "-c:a",
-        "aac",
+        "copy",
         "-b:a",
         "128k",
         str(output_path),
     ]
 
 
-async def run_ffmpeg(cmd: list[str], timeout: int = 120) -> None:
+async def run_ffmpeg(cmd: list[str], timeout: int = 300) -> None:
     logger.info("Running ffmpeg: %s", " ".join(cmd))
     try:
         process = await asyncio.create_subprocess_exec(
